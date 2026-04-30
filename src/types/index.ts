@@ -17,3 +17,31 @@ export interface MockConfig {
   routes: MockRoute[];
   defaultResponse?: MockResponse;
 }
+
+export type HotReloadStatus = 'success' | 'error' | 'initial';
+
+export interface HotReloadEvent {
+  timestamp: number;
+  version: number;
+  success: boolean;
+  errorMessage?: string;
+  retryCount?: number;
+}
+
+export interface HotReloadState {
+  currentVersion: number;
+  status: HotReloadStatus;
+  lastSuccess: {
+    timestamp: number;
+    version: number;
+  } | null;
+  lastFailure: {
+    timestamp: number;
+    version: number;
+    errorMessage: string;
+  } | null;
+  consecutiveFailures: number;
+  totalSuccesses: number;
+  totalFailures: number;
+  recentEvents: HotReloadEvent[];
+}

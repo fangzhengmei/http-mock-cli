@@ -1,4 +1,9 @@
-import { MockConfig } from './types';
+import {
+  MockConfig,
+  HotReloadStatus,
+  HotReloadEvent,
+  HotReloadState,
+} from './types';
 import { ConfigLoader } from './core/config';
 import { MockServer, ConfigUpdateResult } from './core/server';
 import { ConfigWatcher } from './core/watcher';
@@ -386,9 +391,65 @@ export class MockServerCLI {
   hasPreviousConfig(): boolean {
     return this.server?.hasPreviousConfig() ?? false;
   }
+
+  getHotReloadState(): HotReloadState | null {
+    if (!this.server) {
+      return null;
+    }
+    return this.server.getHotReloadState();
+  }
+
+  getLastSuccess(): { timestamp: number; version: number } | null {
+    if (!this.server) {
+      return null;
+    }
+    return this.server.getLastSuccess();
+  }
+
+  getLastFailure(): { timestamp: number; version: number; errorMessage: string } | null {
+    if (!this.server) {
+      return null;
+    }
+    return this.server.getLastFailure();
+  }
+
+  getConsecutiveFailures(): number {
+    if (!this.server) {
+      return 0;
+    }
+    return this.server.getConsecutiveFailures();
+  }
+
+  getTotalSuccesses(): number {
+    if (!this.server) {
+      return 0;
+    }
+    return this.server.getTotalSuccesses();
+  }
+
+  getTotalFailures(): number {
+    if (!this.server) {
+      return 0;
+    }
+    return this.server.getTotalFailures();
+  }
+
+  getRecentEvents(): HotReloadEvent[] {
+    if (!this.server) {
+      return [];
+    }
+    return this.server.getRecentEvents();
+  }
 }
 
-export { MockConfig, MockRoute, MockResponse } from './types';
+export {
+  MockConfig,
+  MockRoute,
+  MockResponse,
+  HotReloadStatus,
+  HotReloadEvent,
+  HotReloadState,
+} from './types';
 export { ConfigLoader } from './core/config';
 export { MockServer, ConfigUpdateResult } from './core/server';
 export { Router } from './core/router';

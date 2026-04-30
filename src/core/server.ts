@@ -1,6 +1,13 @@
 import * as express from 'express';
 import { Server as HttpServer } from 'http';
-import { MockConfig, MockResponse, MockRoute } from '../types';
+import {
+  MockConfig,
+  MockResponse,
+  MockRoute,
+  HotReloadStatus,
+  HotReloadEvent,
+  HotReloadState,
+} from '../types';
 import { Router } from './router';
 import { TemplateEngine } from './template';
 
@@ -15,6 +22,8 @@ export interface ConfigUpdateResult {
   message: string;
 }
 
+const MAX_RECENT_EVENTS = 10;
+
 export class MockServer {
   private app: express.Application;
   private server: HttpServer | null = null;
@@ -24,6 +33,14 @@ export class MockServer {
   private config: MockConfig;
   private previousConfig: MockConfig | null = null;
   private configVersion: number = 1;
+
+  private hotReloadStatus: HotReloadStatus = 'initial';
+  private lastSuccess: { timestamp: number; version: number } | null = null;
+  private lastFailure: { timestamp: number; version: number; errorMessage: string } | null = null;
+  private consecutiveFailures: number = 0;
+  private totalSuccesses: number = 0;
+  private totalFailures: number = 0;
+  private recentEvents: HotReloadEvent[] = [];
 
   constructor(config: MockConfig) {
     this.validateConfig(config);
@@ -35,6 +52,18 @@ export class MockServer {
       status: 404,
       body: { error: 'Not Found' },
     };
+
+    const initialTime = Date.now();
+    this.lastSuccess = {
+      timestamp: initialTime,
+      version: 1,
+    };
+
+    this.recentEvents.push({
+      timestamp: initialTime,
+      version: 1,
+      success: true,
+    });
 
     this.app = this.createExpressApp();
   }
@@ -112,6 +141,44 @@ export class MockServer {
     });
 
     return cloned;
+  }
+
+  private addEvent(event: HotReloadEvent): void {
+    this.recentEvents.push(event);
+    if (this.recentEvents.length > MAX_RECENT_EVENTS) {
+      this.recentEvents.shift();
+    }
+  }
+
+  private recordSuccess(version: number): void {
+    const timestamp = Date.now();
+    this.hotReloadStatus = 'success';
+    this.lastSuccess = { timestamp, version };
+    this.consecutiveFailures = 0;
+    this.totalSuccesses++;
+    this.lastFailure = null;
+
+    this.addEvent({
+      timestamp,
+      version,
+      success: true,
+    });
+  }
+
+  private recordFailure(version: number, errorMessage: string, retryCount?: number): void {
+    const timestamp = Date.now();
+    this.hotReloadStatus = 'error';
+    this.lastFailure = { timestamp, version, errorMessage };
+    this.consecutiveFailures++;
+    this.totalFailures++;
+
+    this.addEvent({
+      timestamp,
+      version,
+      success: false,
+      errorMessage,
+      retryCount,
+    });
   }
 
   private createExpressApp(): express.Application {
@@ -274,17 +341,21 @@ export class MockServer {
     console.log(`\n[配置更新] 开始验证新配置...`);
     console.log(`[配置更新] 当前版本: v${oldVersion}`);
 
+    let validationError: string | null = null;
+
     try {
       this.validateConfig(newConfig);
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error(`[配置更新失败] 配置验证失败: ${errorMessage}`);
+      validationError = error instanceof Error ? error.message : String(error);
+      console.error(`[配置更新失败] 配置验证失败: ${validationError}`);
       console.error(`[配置更新失败] 保持使用当前版本 v${oldVersion}`);
+
+      this.recordFailure(oldVersion, validationError);
 
       return {
         success: false,
-        error: new Error(`配置验证失败: ${errorMessage}`),
-        message: `配置验证失败，保持使用当前版本 v${oldVersion}。错误: ${errorMessage}`,
+        error: new Error(`配置验证失败: ${validationError}`),
+        message: `配置验证失败，保持使用当前版本 v${oldVersion}。错误: ${validationError}`,
       };
     }
 
@@ -311,6 +382,7 @@ export class MockServer {
       }
 
       this.configVersion = newVersion;
+      this.recordSuccess(newVersion);
 
       console.log(`[配置更新成功] 版本已更新到 v${newVersion}`);
       console.log(`[配置更新] 上一版 v${oldVersion} 已保存，可用于回滚`);
@@ -335,12 +407,16 @@ export class MockServer {
           this.defaultResponse = this.config.defaultResponse;
         }
         console.log(`[配置更新] 成功回滚到版本 v${oldVersion}`);
+
+        this.recordFailure(oldVersion, `应用失败后回滚: ${errorMessage}`);
       } catch (rollbackError) {
         const rollbackErrorMessage = rollbackError instanceof Error
           ? rollbackError.message
           : String(rollbackError);
         console.error(`[配置更新严重错误] 回滚失败: ${rollbackErrorMessage}`);
         console.error(`[配置更新严重错误] 服务器可能处于不一致状态`);
+
+        this.recordFailure(oldVersion, `更新失败且回滚也失败: ${errorMessage}, 回滚错误: ${rollbackErrorMessage}`);
 
         return {
           success: false,
@@ -388,6 +464,8 @@ export class MockServer {
       this.configVersion = previousVersion;
       this.previousConfig = null;
 
+      this.recordSuccess(previousVersion);
+
       console.log(`[配置回滚成功] 已回滚到版本 v${previousVersion}`);
       console.log(`[配置回滚] 可用路由:`);
       this.router.getAllRoutes().forEach(route => {
@@ -427,6 +505,56 @@ export class MockServer {
       return null;
     }
     return this.deepCloneConfig(this.previousConfig);
+  }
+
+  getHotReloadState(): HotReloadState {
+    return {
+      currentVersion: this.configVersion,
+      status: this.hotReloadStatus,
+      lastSuccess: this.lastSuccess
+        ? {
+            timestamp: this.lastSuccess.timestamp,
+            version: this.lastSuccess.version,
+          }
+        : null,
+      lastFailure: this.lastFailure
+        ? {
+            timestamp: this.lastFailure.timestamp,
+            version: this.lastFailure.version,
+            errorMessage: this.lastFailure.errorMessage,
+          }
+        : null,
+      consecutiveFailures: this.consecutiveFailures,
+      totalSuccesses: this.totalSuccesses,
+      totalFailures: this.totalFailures,
+      recentEvents: [...this.recentEvents],
+    };
+  }
+
+  getLastSuccess(): { timestamp: number; version: number } | null {
+    if (!this.lastSuccess) return null;
+    return { ...this.lastSuccess };
+  }
+
+  getLastFailure(): { timestamp: number; version: number; errorMessage: string } | null {
+    if (!this.lastFailure) return null;
+    return { ...this.lastFailure };
+  }
+
+  getConsecutiveFailures(): number {
+    return this.consecutiveFailures;
+  }
+
+  getTotalSuccesses(): number {
+    return this.totalSuccesses;
+  }
+
+  getTotalFailures(): number {
+    return this.totalFailures;
+  }
+
+  getRecentEvents(): HotReloadEvent[] {
+    return [...this.recentEvents];
   }
 
   getApp(): express.Application {
