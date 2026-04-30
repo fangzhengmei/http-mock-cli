@@ -7,6 +7,8 @@ export interface MockServerCLIOptions {
   configPath: string;
   port?: number;
   watch?: boolean;
+  maxRetries?: number;
+  retryIntervalMs?: number;
 }
 
 export interface ReloadResult {
@@ -14,6 +16,7 @@ export interface ReloadResult {
   error?: Error;
   message: string;
   configVersion?: number;
+  retryCount?: number;
 }
 
 export class MockServerCLI {
@@ -24,11 +27,15 @@ export class MockServerCLI {
   private watch: boolean;
   private initialConfigLoaded: boolean = false;
   private isReloading: boolean = false;
+  private maxRetries: number;
+  private retryIntervalMs: number;
 
   constructor(options: MockServerCLIOptions) {
     this.configLoader = new ConfigLoader(options.configPath);
     this.port = options.port;
     this.watch = options.watch ?? true;
+    this.maxRetries = options.maxRetries ?? 5;
+    this.retryIntervalMs = options.retryIntervalMs ?? 300;
   }
 
   async start(): Promise<void> {
@@ -143,100 +150,155 @@ export class MockServerCLI {
     console.log('\n' + '='.repeat(60));
     console.log('[配置热加载] 检测到配置文件变化，开始热加载...');
     console.log(`[配置热加载] 当前配置版本: v${currentVersion}`);
+    console.log(`[配置热加载] 最大重试次数: ${this.maxRetries}`);
+    console.log(`[配置热加载] 重试间隔: ${this.retryIntervalMs}ms`);
     console.log('='.repeat(60));
 
-    try {
-      console.log('\n[配置热加载] 步骤 1/4: 正在解析新配置...');
-      const newConfig = this.configLoader.load();
-      console.log('[配置热加载] 步骤 1/4: 新配置解析成功');
+    let lastError: Error | null = null;
+    let lastErrorMessage = '';
 
-      if (this.port !== undefined) {
-        newConfig.port = this.port;
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      const isFirstAttempt = attempt === 0;
+      const attemptNumber = isFirstAttempt ? 1 : attempt + 1;
+
+      if (!isFirstAttempt) {
+        console.log(`\n[配置热加载] 重试 ${attemptNumber}/${this.maxRetries + 1}...`);
+        console.log(`[配置热加载] 等待 ${this.retryIntervalMs}ms 后重试...`);
+        await this.sleep(this.retryIntervalMs);
       }
 
-      if (!this.server) {
-        const message = '[配置热加载] 服务器未运行，无法更新配置';
-        console.error(message);
-        this.isReloading = false;
-        return {
-          success: false,
-          error: new Error(message),
-          message,
-        };
+      console.log(`\n[配置热加载] 尝试 ${attemptNumber}/${this.maxRetries + 1}`);
+
+      try {
+        console.log('[配置热加载] 步骤 1/4: 正在解析新配置...');
+        const newConfig = this.configLoader.load();
+        console.log('[配置热加载] 步骤 1/4: 新配置解析成功');
+
+        if (this.port !== undefined) {
+          newConfig.port = this.port;
+        }
+
+        if (!this.server) {
+          const message = '[配置热加载] 服务器未运行，无法更新配置';
+          console.error(message);
+          this.isReloading = false;
+          return {
+            success: false,
+            error: new Error(message),
+            message,
+            retryCount: attempt,
+          };
+        }
+
+        console.log('[配置热加载] 步骤 2/4: 正在验证新配置...');
+        console.log('[配置热加载] 步骤 2/4: 验证将在 updateConfig 中进行');
+
+        console.log('[配置热加载] 步骤 3/4: 正在应用新配置...');
+        const updateResult: ConfigUpdateResult = this.server.updateConfig(newConfig);
+
+        console.log('[配置热加载] 步骤 4/4: 检查更新结果...');
+
+        if (updateResult.success) {
+          const newVersion = this.server.getConfigVersion();
+          console.log('\n' + '='.repeat(60));
+          console.log('[配置热加载成功] ✅');
+          console.log(`[配置热加载] 尝试次数: ${attemptNumber}/${this.maxRetries + 1}`);
+          console.log(`[配置热加载] 版本: v${currentVersion} -> v${newVersion}`);
+          console.log(`[配置热加载] 提示: ${updateResult.message}`);
+          console.log('='.repeat(60));
+
+          this.isReloading = false;
+          return {
+            success: true,
+            message: updateResult.message,
+            configVersion: newVersion,
+            retryCount: attempt,
+          };
+        } else {
+          lastError = updateResult.error || null;
+          lastErrorMessage = updateResult.message;
+
+          console.log(`[配置热加载] 本次尝试失败: ${updateResult.message}`);
+
+          if (attempt < this.maxRetries) {
+            console.log(`[配置热加载] 将在 ${this.retryIntervalMs}ms 后重试...`);
+          } else {
+            const remainingVersion = this.server.getConfigVersion();
+            console.error('\n' + '='.repeat(60));
+            console.error('[配置热加载最终失败] ❌');
+            console.error(`[配置热加载] 总尝试次数: ${this.maxRetries + 1}`);
+            console.error(`[配置热加载] 最后错误: ${lastErrorMessage}`);
+            console.error('\n[配置热加载] 安全措施已生效:');
+            console.error(`  - 服务器继续使用当前可用配置运行`);
+            console.error(`  - 当前配置版本: v${remainingVersion}`);
+            console.error('\n[配置热加载] 建议操作:');
+            console.error('  1. 检查配置文件中的错误');
+            console.error('  2. 修复错误后保存配置文件');
+            console.error('  3. 配置文件修改后会自动重试热加载');
+            console.error('='.repeat(60));
+
+            this.isReloading = false;
+            return {
+              success: false,
+              error: lastError || new Error(lastErrorMessage),
+              message: lastErrorMessage,
+              configVersion: remainingVersion,
+              retryCount: this.maxRetries,
+            };
+          }
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        lastError = error instanceof Error ? error : new Error(errorMessage);
+        lastErrorMessage = errorMessage;
+
+        console.log(`[配置热加载] 本次尝试异常: ${errorMessage}`);
+
+        if (attempt < this.maxRetries) {
+          console.log(`[配置热加载] 将在 ${this.retryIntervalMs}ms 后重试...`);
+        } else {
+          const remainingVersion = this.server?.getConfigVersion();
+
+          console.error('\n' + '='.repeat(60));
+          console.error('[配置热加载最终失败] ❌');
+          console.error(`[配置热加载] 总尝试次数: ${this.maxRetries + 1}`);
+          console.error(`[配置热加载] 错误类型: ${error instanceof SyntaxError ? '语法错误' : '运行时错误'}`);
+          console.error(`[配置热加载] 最后错误: ${errorMessage}`);
+          console.error('\n[配置热加载] 安全措施已生效:');
+          console.error(`  - 配置加载过程中出现异常`);
+          console.error(`  - 服务器将继续使用当前可用配置运行`);
+          if (remainingVersion) {
+            console.error(`  - 当前配置版本: v${remainingVersion}`);
+          }
+          console.error('\n[配置热加载] 建议操作:');
+          console.error('  1. 检查配置文件的语法是否正确');
+          console.error('  2. 确保所有必需的字段都已正确配置');
+          console.error('  3. 修复错误后保存配置文件');
+          console.error('='.repeat(60));
+
+          this.isReloading = false;
+          return {
+            success: false,
+            error: lastError,
+            message: `配置热加载最终失败: ${errorMessage}`,
+            configVersion: remainingVersion,
+            retryCount: this.maxRetries,
+          };
+        }
       }
-
-      console.log('\n[配置热加载] 步骤 2/4: 正在验证新配置...');
-      console.log('[配置热加载] 步骤 2/4: 验证将在 updateConfig 中进行');
-
-      console.log('\n[配置热加载] 步骤 3/4: 正在应用新配置...');
-      const updateResult: ConfigUpdateResult = this.server.updateConfig(newConfig);
-
-      console.log('\n[配置热加载] 步骤 4/4: 检查更新结果...');
-
-      if (updateResult.success) {
-        const newVersion = this.server.getConfigVersion();
-        console.log('\n' + '='.repeat(60));
-        console.log('[配置热加载成功] ✅');
-        console.log(`[配置热加载] 版本: v${currentVersion} -> v${newVersion}`);
-        console.log(`[配置热加载] 提示: ${updateResult.message}`);
-        console.log('='.repeat(60));
-
-        this.isReloading = false;
-        return {
-          success: true,
-          message: updateResult.message,
-          configVersion: newVersion,
-        };
-      } else {
-        const remainingVersion = this.server.getConfigVersion();
-        console.error('\n' + '='.repeat(60));
-        console.error('[配置热加载失败] ❌');
-        console.error(`[配置热加载] 错误: ${updateResult.message}`);
-        console.error('\n[配置热加载] 安全措施已生效:');
-        console.error(`  - 服务器继续使用当前可用配置运行`);
-        console.error(`  - 当前配置版本: v${remainingVersion}`);
-        console.error('\n[配置热加载] 建议操作:');
-        console.error('  1. 检查配置文件中的错误');
-        console.error('  2. 修复错误后保存配置文件');
-        console.error('  3. 配置文件修改后会自动重试热加载');
-        console.error('='.repeat(60));
-
-        this.isReloading = false;
-        return {
-          success: false,
-          error: updateResult.error,
-          message: updateResult.message,
-          configVersion: remainingVersion,
-        };
-      }
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const remainingVersion = this.server?.getConfigVersion();
-
-      console.error('\n' + '='.repeat(60));
-      console.error('[配置热加载异常] ❌');
-      console.error(`[配置热加载] 错误类型: ${error instanceof SyntaxError ? '语法错误' : '运行时错误'}`);
-      console.error(`[配置热加载] 错误详情: ${errorMessage}`);
-      console.error('\n[配置热加载] 安全措施已生效:');
-      console.error(`  - 配置加载过程中出现异常`);
-      console.error(`  - 服务器将继续使用当前可用配置运行`);
-      if (remainingVersion) {
-        console.error(`  - 当前配置版本: v${remainingVersion}`);
-      }
-      console.error('\n[配置热加载] 建议操作:');
-      console.error('  1. 检查配置文件的语法是否正确');
-      console.error('  2. 确保所有必需的字段都已正确配置');
-      console.error('  3. 修复错误后保存配置文件');
-      console.error('='.repeat(60));
-
-      this.isReloading = false;
-      return {
-        success: false,
-        error: error instanceof Error ? error : new Error(errorMessage),
-        message: `配置热加载异常: ${errorMessage}`,
-        configVersion: remainingVersion,
-      };
     }
+
+    this.isReloading = false;
+    return {
+      success: false,
+      error: new Error('未知错误'),
+      message: '配置热加载失败，未知错误',
+      retryCount: this.maxRetries,
+    };
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   async rollback(): Promise<ReloadResult> {
