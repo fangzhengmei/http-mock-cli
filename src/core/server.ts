@@ -58,6 +58,7 @@ export class MockServer {
       timestamp: initialTime,
       version: 1,
     };
+    this.totalSuccesses = 1;
 
     this.recentEvents.push({
       timestamp: initialTime,
@@ -156,7 +157,6 @@ export class MockServer {
     this.lastSuccess = { timestamp, version };
     this.consecutiveFailures = 0;
     this.totalSuccesses++;
-    this.lastFailure = null;
 
     this.addEvent({
       timestamp,

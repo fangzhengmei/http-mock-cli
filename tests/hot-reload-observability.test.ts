@@ -640,4 +640,433 @@ describe('Hot Reload Observability', () => {
       expect(finalState.lastFailure?.version).toBe(2);
     });
   });
+
+  describe('High Frequency Continuous Changes - State Consistency', () => {
+    const goodConfigFactory = (index: number): MockConfig => ({
+      port: 0,
+      routes: [
+        {
+          method: 'GET',
+          path: `/api/route-${index}`,
+          response: { status: 200, body: { index } },
+        },
+      ],
+    });
+
+    const badConfigFactory = (index: number): MockConfig => ({
+      port: 0,
+      routes: [
+        {
+          // @ts-ignore: Intentional invalid method for testing
+          method: `BAD-${index}`,
+          path: `/test`,
+          response: { status: 200, body: {} },
+        },
+      ],
+    });
+
+    it('should maintain consistent state during rapid successive successful updates', () => {
+      const server = new MockServer(initialConfig);
+      const iterations = 20;
+
+      for (let i = 0; i < iterations; i++) {
+        const result = server.updateConfig(goodConfigFactory(i));
+        expect(result.success).toBe(true);
+
+        const state = server.getHotReloadState();
+
+        expect(state.currentVersion).toBe(2 + i);
+        expect(state.status).toBe('success');
+        expect(state.consecutiveFailures).toBe(0);
+        expect(state.totalSuccesses).toBe(2 + i);
+        expect(state.totalFailures).toBe(0);
+        expect(state.lastSuccess?.version).toBe(2 + i);
+        expect(state.lastFailure).toBeNull();
+
+        const events = server.getRecentEvents();
+        const lastEvent = events[events.length - 1];
+        expect(lastEvent.success).toBe(true);
+        expect(lastEvent.version).toBe(2 + i);
+      }
+
+      const finalState = server.getHotReloadState();
+      expect(finalState.currentVersion).toBe(1 + iterations);
+      expect(finalState.totalSuccesses).toBe(1 + iterations);
+    });
+
+    it('should maintain consistent state during rapid successive failed updates', () => {
+      const server = new MockServer(initialConfig);
+      const iterations = 20;
+
+      for (let i = 0; i < iterations; i++) {
+        const result = server.updateConfig(badConfigFactory(i));
+        expect(result.success).toBe(false);
+
+        const state = server.getHotReloadState();
+
+        expect(state.currentVersion).toBe(1);
+        expect(state.status).toBe('error');
+        expect(state.consecutiveFailures).toBe(i + 1);
+        expect(state.totalSuccesses).toBe(1);
+        expect(state.totalFailures).toBe(i + 1);
+        expect(state.lastSuccess?.version).toBe(1);
+        expect(state.lastFailure?.version).toBe(1);
+        expect(state.lastFailure?.errorMessage).toContain(`BAD-${i}`);
+
+        const events = server.getRecentEvents();
+        const lastEvent = events[events.length - 1];
+        expect(lastEvent.success).toBe(false);
+        expect(lastEvent.version).toBe(1);
+        expect(lastEvent.errorMessage).toContain(`BAD-${i}`);
+      }
+
+      const finalState = server.getHotReloadState();
+      expect(finalState.currentVersion).toBe(1);
+      expect(finalState.consecutiveFailures).toBe(iterations);
+      expect(finalState.totalFailures).toBe(iterations);
+    });
+
+    it('should maintain consistent state during alternating success-failure updates', () => {
+      const server = new MockServer(initialConfig);
+      const cycles = 10;
+      let expectedVersion = 1;
+      let expectedSuccesses = 1;
+      let expectedFailures = 0;
+      let expectedConsecutiveFailures = 0;
+
+      for (let cycle = 0; cycle < cycles; cycle++) {
+        const goodResult = server.updateConfig(goodConfigFactory(cycle));
+        expect(goodResult.success).toBe(true);
+        expectedVersion++;
+        expectedSuccesses++;
+        expectedConsecutiveFailures = 0;
+
+        let state = server.getHotReloadState();
+        expect(state.currentVersion).toBe(expectedVersion);
+        expect(state.status).toBe('success');
+        expect(state.consecutiveFailures).toBe(0);
+        expect(state.totalSuccesses).toBe(expectedSuccesses);
+        expect(state.totalFailures).toBe(expectedFailures);
+
+        const badResult = server.updateConfig(badConfigFactory(cycle));
+        expect(badResult.success).toBe(false);
+        expectedFailures++;
+        expectedConsecutiveFailures++;
+
+        state = server.getHotReloadState();
+        expect(state.currentVersion).toBe(expectedVersion);
+        expect(state.status).toBe('error');
+        expect(state.consecutiveFailures).toBe(expectedConsecutiveFailures);
+        expect(state.totalSuccesses).toBe(expectedSuccesses);
+        expect(state.totalFailures).toBe(expectedFailures);
+      }
+
+      const finalState = server.getHotReloadState();
+      expect(finalState.currentVersion).toBe(1 + cycles);
+      expect(finalState.totalSuccesses).toBe(1 + cycles);
+      expect(finalState.totalFailures).toBe(cycles);
+      expect(finalState.status).toBe('error');
+      expect(finalState.consecutiveFailures).toBe(1);
+      expect(finalState.lastSuccess?.version).toBe(1 + cycles);
+      expect(finalState.lastFailure?.version).toBe(1 + cycles);
+    });
+
+    it('should maintain consistent state during rapid mixed updates (recovery scenarios)', () => {
+      const server = new MockServer(initialConfig);
+      let expectedVersion = 1;
+      let expectedSuccesses = 1;
+      let expectedFailures = 0;
+
+      const badConfig1 = badConfigFactory(1);
+      server.updateConfig(badConfig1);
+      server.updateConfig(badConfig1);
+      expectedFailures += 2;
+
+      let state = server.getHotReloadState();
+      expect(state.status).toBe('error');
+      expect(state.consecutiveFailures).toBe(2);
+      expect(state.totalFailures).toBe(2);
+      expect(state.currentVersion).toBe(1);
+
+      const goodConfig1 = goodConfigFactory(1);
+      server.updateConfig(goodConfig1);
+      expectedVersion++;
+      expectedSuccesses++;
+
+      state = server.getHotReloadState();
+      expect(state.status).toBe('success');
+      expect(state.consecutiveFailures).toBe(0);
+      expect(state.currentVersion).toBe(2);
+      expect(state.totalSuccesses).toBe(2);
+      expect(state.totalFailures).toBe(2);
+      expect(state.lastFailure?.errorMessage).toContain('BAD-1');
+
+      const badConfig2 = badConfigFactory(2);
+      server.updateConfig(badConfig2);
+      server.updateConfig(badConfig2);
+      server.updateConfig(badConfig2);
+      expectedFailures += 3;
+
+      state = server.getHotReloadState();
+      expect(state.status).toBe('error');
+      expect(state.consecutiveFailures).toBe(3);
+      expect(state.totalFailures).toBe(5);
+      expect(state.currentVersion).toBe(2);
+      expect(state.lastSuccess?.version).toBe(2);
+
+      const goodConfig2 = goodConfigFactory(2);
+      server.updateConfig(goodConfig2);
+      expectedVersion++;
+      expectedSuccesses++;
+
+      state = server.getHotReloadState();
+      expect(state.status).toBe('success');
+      expect(state.consecutiveFailures).toBe(0);
+      expect(state.currentVersion).toBe(3);
+      expect(state.totalSuccesses).toBe(3);
+      expect(state.totalFailures).toBe(5);
+      expect(state.lastFailure?.errorMessage).toContain('BAD-2');
+    });
+
+    it('should have consistent timestamps across related state fields', () => {
+      const server = new MockServer(initialConfig);
+      const initialState = server.getHotReloadState();
+      const initialSuccessTime = initialState.lastSuccess?.timestamp;
+
+      expect(initialSuccessTime).toBeGreaterThan(0);
+      expect(initialState.recentEvents[0].timestamp).toBe(initialSuccessTime);
+
+      const goodConfig = goodConfigFactory(1);
+      const beforeUpdate = Date.now();
+      server.updateConfig(goodConfig);
+      const afterUpdate = Date.now();
+
+      const state = server.getHotReloadState();
+      const successTime = state.lastSuccess?.timestamp;
+
+      expect(successTime).toBeGreaterThanOrEqual(beforeUpdate);
+      expect(successTime).toBeLessThanOrEqual(afterUpdate);
+
+      const events = state.recentEvents;
+      const lastEvent = events[events.length - 1];
+      expect(lastEvent.timestamp).toBe(successTime);
+
+      const badConfig = badConfigFactory(1);
+      const beforeFailure = Date.now();
+      server.updateConfig(badConfig);
+      const afterFailure = Date.now();
+
+      const failedState = server.getHotReloadState();
+      const failureTime = failedState.lastFailure?.timestamp;
+
+      expect(failureTime).toBeGreaterThanOrEqual(beforeFailure);
+      expect(failureTime).toBeLessThanOrEqual(afterFailure);
+      expect(failedState.lastSuccess?.timestamp).toBe(successTime);
+
+      const failedEvents = failedState.recentEvents;
+      const lastFailedEvent = failedEvents[failedEvents.length - 1];
+      expect(lastFailedEvent.timestamp).toBe(failureTime);
+      expect(lastFailedEvent.success).toBe(false);
+    });
+
+    it('should maintain state consistency when events exceed MAX_RECENT_EVENTS', () => {
+      const server = new MockServer(initialConfig);
+      const goodConfig = goodConfigFactory(1);
+
+      for (let i = 0; i < 20; i++) {
+        server.updateConfig(goodConfig);
+      }
+
+      const events = server.getRecentEvents();
+      expect(events.length).toBeLessThanOrEqual(10);
+
+      const state = server.getHotReloadState();
+      expect(state.totalSuccesses).toBe(21);
+      expect(state.currentVersion).toBe(21);
+      expect(state.lastSuccess?.version).toBe(21);
+
+      const lastEvent = events[events.length - 1];
+      expect(lastEvent.version).toBe(21);
+      expect(lastEvent.success).toBe(true);
+    });
+
+    it('should return consistent snapshots from getHotReloadState()', () => {
+      const server = new MockServer(initialConfig);
+
+      const state1 = server.getHotReloadState();
+      const state2 = server.getHotReloadState();
+
+      expect(state1).not.toBe(state2);
+      expect(state1.currentVersion).toBe(state2.currentVersion);
+      expect(state1.status).toBe(state2.status);
+      expect(state1.totalSuccesses).toBe(state2.totalSuccesses);
+      expect(state1.lastSuccess?.version).toBe(state2.lastSuccess?.version);
+
+      const goodConfig = goodConfigFactory(1);
+      server.updateConfig(goodConfig);
+
+      const state3 = server.getHotReloadState();
+      expect(state3.currentVersion).toBe(2);
+      expect(state3.status).toBe('success');
+      expect(state3.totalSuccesses).toBe(2);
+    });
+  });
+
+  describe('State Field Semantics - Documentation Examples', () => {
+    it('should demonstrate how to check current status', () => {
+      const server = new MockServer(initialConfig);
+
+      const status = server.getHotReloadState().status;
+      expect(status).toBe('initial');
+      expect(['initial', 'success', 'error']).toContain(status);
+
+      const goodConfig = goodConfigFactory(1);
+      server.updateConfig(goodConfig);
+
+      const successStatus = server.getHotReloadState().status;
+      expect(successStatus).toBe('success');
+
+      const badConfig = badConfigFactory(1);
+      server.updateConfig(badConfig);
+
+      const errorStatus = server.getHotReloadState().status;
+      expect(errorStatus).toBe('error');
+    });
+
+    it('should demonstrate how to check for configuration health', () => {
+      const server = new MockServer(initialConfig);
+      const badConfig = badConfigFactory(1);
+
+      server.updateConfig(badConfig);
+      server.updateConfig(badConfig);
+      server.updateConfig(badConfig);
+
+      const state = server.getHotReloadState();
+
+      const isHealthy = state.status !== 'error';
+      const hasConsecutiveFailures = state.consecutiveFailures > 0;
+      const consecutiveFailureCount = state.consecutiveFailures;
+
+      expect(isHealthy).toBe(false);
+      expect(hasConsecutiveFailures).toBe(true);
+      expect(consecutiveFailureCount).toBe(3);
+
+      const goodConfig = goodConfigFactory(1);
+      server.updateConfig(goodConfig);
+
+      const recoveredState = server.getHotReloadState();
+      expect(recoveredState.status).toBe('success');
+      expect(recoveredState.consecutiveFailures).toBe(0);
+    });
+
+    it('should demonstrate how to get last failure details', () => {
+      const server = new MockServer(initialConfig);
+      const badConfig = badConfigFactory(999);
+
+      server.updateConfig(badConfig);
+
+      const lastFailure = server.getLastFailure();
+
+      expect(lastFailure).not.toBeNull();
+      expect(lastFailure?.version).toBe(1);
+      expect(lastFailure?.errorMessage).toContain('BAD-999');
+      expect(lastFailure?.timestamp).toBeGreaterThan(0);
+
+      const goodConfig = goodConfigFactory(1);
+      server.updateConfig(goodConfig);
+
+      const lastFailureAfterRecovery = server.getLastFailure();
+      expect(lastFailureAfterRecovery).not.toBeNull();
+      expect(lastFailureAfterRecovery?.errorMessage).toContain('BAD-999');
+
+      const lastSuccess = server.getLastSuccess();
+      expect(lastSuccess?.version).toBe(2);
+    });
+
+    it('should demonstrate how to access event history', () => {
+      const server = new MockServer(initialConfig);
+
+      server.updateConfig(goodConfigFactory(1));
+      server.updateConfig(badConfigFactory(1));
+      server.updateConfig(badConfigFactory(2));
+      server.updateConfig(goodConfigFactory(2));
+
+      const events = server.getRecentEvents();
+
+      expect(events.length).toBe(5);
+
+      expect(events[0].success).toBe(true);
+      expect(events[0].version).toBe(1);
+
+      expect(events[1].success).toBe(true);
+      expect(events[1].version).toBe(2);
+
+      expect(events[2].success).toBe(false);
+      expect(events[2].version).toBe(2);
+
+      expect(events[3].success).toBe(false);
+      expect(events[3].version).toBe(2);
+
+      expect(events[4].success).toBe(true);
+      expect(events[4].version).toBe(3);
+
+      const failedEvents = events.filter(e => !e.success);
+      expect(failedEvents.length).toBe(2);
+
+      const successEvents = events.filter(e => e.success);
+      expect(successEvents.length).toBe(3);
+    });
+
+    it('should demonstrate how to use total counters for monitoring', () => {
+      const server = new MockServer(initialConfig);
+
+      const totalSuccessesBefore = server.getTotalSuccesses();
+      const totalFailuresBefore = server.getTotalFailures();
+
+      expect(totalSuccessesBefore).toBe(1);
+      expect(totalFailuresBefore).toBe(0);
+
+      server.updateConfig(goodConfigFactory(1));
+      server.updateConfig(badConfigFactory(1));
+      server.updateConfig(goodConfigFactory(2));
+      server.updateConfig(badConfigFactory(2));
+      server.updateConfig(badConfigFactory(3));
+
+      const totalSuccesses = server.getTotalSuccesses();
+      const totalFailures = server.getTotalFailures();
+
+      expect(totalSuccesses).toBe(3);
+      expect(totalFailures).toBe(3);
+
+      const failureRate = totalFailures / (totalSuccesses + totalFailures);
+      expect(failureRate).toBe(0.5);
+    });
+  });
 });
+
+function goodConfigFactory(index: number): MockConfig {
+  return {
+    port: 0,
+    routes: [
+      {
+        method: 'GET',
+        path: `/api/route-${index}`,
+        response: { status: 200, body: { index } },
+      },
+    ],
+  };
+}
+
+function badConfigFactory(index: number): MockConfig {
+  return {
+    port: 0,
+    routes: [
+      {
+        // @ts-ignore: Intentional invalid method for testing
+        method: `BAD-${index}`,
+        path: `/test`,
+        response: { status: 200, body: {} },
+      },
+    ],
+  };
+}

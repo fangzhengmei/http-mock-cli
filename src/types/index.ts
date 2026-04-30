@@ -18,7 +18,7 @@ export interface MockConfig {
   defaultResponse?: MockResponse;
 }
 
-export type HotReloadStatus = 'success' | 'error' | 'initial';
+export type HotReloadStatus = 'initial' | 'success' | 'error';
 
 export interface HotReloadEvent {
   timestamp: number;
