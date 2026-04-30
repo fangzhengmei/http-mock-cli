@@ -1,12 +1,19 @@
 import { MockConfig } from './types';
 import { ConfigLoader } from './core/config';
-import { MockServer } from './core/server';
+import { MockServer, ConfigUpdateResult } from './core/server';
 import { ConfigWatcher } from './core/watcher';
 
-export interface MockServerCLI {
+export interface MockServerCLIOptions {
   configPath: string;
   port?: number;
   watch?: boolean;
+}
+
+export interface ReloadResult {
+  success: boolean;
+  error?: Error;
+  message: string;
+  configVersion?: number;
 }
 
 export class MockServerCLI {
@@ -15,72 +22,276 @@ export class MockServerCLI {
   private watcher: ConfigWatcher | null = null;
   private port?: number;
   private watch: boolean;
+  private initialConfigLoaded: boolean = false;
+  private isReloading: boolean = false;
 
-  constructor(options: MockServerCLI) {
+  constructor(options: MockServerCLIOptions) {
     this.configLoader = new ConfigLoader(options.configPath);
     this.port = options.port;
     this.watch = options.watch ?? true;
   }
 
   async start(): Promise<void> {
+    console.log('='.repeat(60));
+    console.log('HTTP Mock Server 启动中...');
+    console.log(`配置文件: ${this.configLoader.getConfigPath()}`);
+    console.log('='.repeat(60));
+
     let config: MockConfig;
 
     try {
+      console.log('\n[启动] 正在加载初始配置...');
       config = this.configLoader.load();
+      this.initialConfigLoaded = true;
+      console.log('[启动] 初始配置加载成功');
     } catch (error) {
-      console.error('加载配置文件失败:', error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error('\n[启动失败] 初始配置加载失败:');
+      console.error(`  错误: ${errorMessage}`);
+      console.error('\n[提示] 请检查配置文件是否存在且格式正确');
+      console.error('[提示] 支持的配置格式: .js, .ts, .json');
+      console.error('[提示] 配置必须包含有效的 routes 数组');
       process.exit(1);
     }
 
     if (this.port !== undefined) {
+      console.log(`[启动] 使用指定端口: ${this.port}`);
       config.port = this.port;
     }
 
-    this.server = new MockServer(config);
+    try {
+      console.log('\n[启动] 正在创建服务器实例...');
+      this.server = new MockServer(config);
+      console.log('[启动] 服务器实例创建成功');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error('\n[启动失败] 创建服务器实例失败:');
+      console.error(`  错误: ${errorMessage}`);
+      process.exit(1);
+    }
 
-    await this.server.start();
+    try {
+      await this.server.start();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error('\n[启动失败] 启动服务器失败:');
+      console.error(`  错误: ${errorMessage}`);
+      process.exit(1);
+    }
 
     if (this.watch) {
+      console.log('\n[配置监听] 正在启动配置文件监听...');
       this.watcher = new ConfigWatcher(this.configLoader.getConfigPath(), {
         onChange: (configPath) => {
           this.reloadConfig();
         },
         onError: (error) => {
-          console.error('配置文件监听错误:', error);
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          console.error('\n[配置监听错误] 文件监听出现错误:');
+          console.error(`  错误: ${errorMessage}`);
+          console.error('[配置监听] 服务器将继续使用当前配置运行');
         },
+        debounceMs: 200,
       });
       this.watcher.start();
+      console.log('[配置监听] 已启动，配置文件修改后将自动热加载');
+    } else {
+      console.log('\n[配置监听] 未启用（使用 --no-watch 参数）');
     }
 
+    console.log('\n' + '='.repeat(60));
+    console.log('HTTP Mock Server 已成功启动！');
+    console.log(`访问地址: http://localhost:${this.server.getPort()}`);
+    console.log(`配置版本: v${this.server.getConfigVersion()}`);
+    if (this.watch) {
+      console.log('配置监听: 已启用');
+    }
+    console.log('='.repeat(60));
+    console.log('\n提示:');
+    console.log('  - 修改配置文件后会自动热加载');
+    console.log('  - 如果新配置无效，将保持当前可用配置');
+    console.log('  - 按 Ctrl+C 停止服务器');
+
     process.on('SIGINT', async () => {
-      console.log('\n正在关闭服务器...');
+      console.log('\n\n[关闭] 正在关闭服务器...');
       await this.stop();
+      console.log('[关闭] 服务器已安全关闭');
       process.exit(0);
     });
 
     process.on('SIGTERM', async () => {
-      console.log('\n正在关闭服务器...');
+      console.log('\n\n[关闭] 正在关闭服务器...');
       await this.stop();
+      console.log('[关闭] 服务器已安全关闭');
       process.exit(0);
     });
   }
 
-  private async reloadConfig(): Promise<void> {
+  async reloadConfig(): Promise<ReloadResult> {
+    if (this.isReloading) {
+      const message = '[配置热加载] 正在处理上一次的重载请求，忽略本次请求';
+      console.log(message);
+      return {
+        success: false,
+        message,
+      };
+    }
+
+    this.isReloading = true;
+    const currentVersion = this.server?.getConfigVersion();
+
+    console.log('\n' + '='.repeat(60));
+    console.log('[配置热加载] 检测到配置文件变化，开始热加载...');
+    console.log(`[配置热加载] 当前配置版本: v${currentVersion}`);
+    console.log('='.repeat(60));
+
     try {
-      console.log('重新加载配置文件...');
-      const config = this.configLoader.load();
+      console.log('\n[配置热加载] 步骤 1/4: 正在解析新配置...');
+      const newConfig = this.configLoader.load();
+      console.log('[配置热加载] 步骤 1/4: 新配置解析成功');
 
       if (this.port !== undefined) {
-        config.port = this.port;
+        newConfig.port = this.port;
       }
 
-      if (this.server) {
-        this.server.updateConfig(config);
+      if (!this.server) {
+        const message = '[配置热加载] 服务器未运行，无法更新配置';
+        console.error(message);
+        this.isReloading = false;
+        return {
+          success: false,
+          error: new Error(message),
+          message,
+        };
       }
 
-      console.log('配置文件重新加载成功');
+      console.log('\n[配置热加载] 步骤 2/4: 正在验证新配置...');
+      console.log('[配置热加载] 步骤 2/4: 验证将在 updateConfig 中进行');
+
+      console.log('\n[配置热加载] 步骤 3/4: 正在应用新配置...');
+      const updateResult: ConfigUpdateResult = this.server.updateConfig(newConfig);
+
+      console.log('\n[配置热加载] 步骤 4/4: 检查更新结果...');
+
+      if (updateResult.success) {
+        const newVersion = this.server.getConfigVersion();
+        console.log('\n' + '='.repeat(60));
+        console.log('[配置热加载成功] ✅');
+        console.log(`[配置热加载] 版本: v${currentVersion} -> v${newVersion}`);
+        console.log(`[配置热加载] 提示: ${updateResult.message}`);
+        console.log('='.repeat(60));
+
+        this.isReloading = false;
+        return {
+          success: true,
+          message: updateResult.message,
+          configVersion: newVersion,
+        };
+      } else {
+        const remainingVersion = this.server.getConfigVersion();
+        console.error('\n' + '='.repeat(60));
+        console.error('[配置热加载失败] ❌');
+        console.error(`[配置热加载] 错误: ${updateResult.message}`);
+        console.error('\n[配置热加载] 安全措施已生效:');
+        console.error(`  - 服务器继续使用当前可用配置运行`);
+        console.error(`  - 当前配置版本: v${remainingVersion}`);
+        console.error('\n[配置热加载] 建议操作:');
+        console.error('  1. 检查配置文件中的错误');
+        console.error('  2. 修复错误后保存配置文件');
+        console.error('  3. 配置文件修改后会自动重试热加载');
+        console.error('='.repeat(60));
+
+        this.isReloading = false;
+        return {
+          success: false,
+          error: updateResult.error,
+          message: updateResult.message,
+          configVersion: remainingVersion,
+        };
+      }
     } catch (error) {
-      console.error('重新加载配置文件失败:', error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const remainingVersion = this.server?.getConfigVersion();
+
+      console.error('\n' + '='.repeat(60));
+      console.error('[配置热加载异常] ❌');
+      console.error(`[配置热加载] 错误类型: ${error instanceof SyntaxError ? '语法错误' : '运行时错误'}`);
+      console.error(`[配置热加载] 错误详情: ${errorMessage}`);
+      console.error('\n[配置热加载] 安全措施已生效:');
+      console.error(`  - 配置加载过程中出现异常`);
+      console.error(`  - 服务器将继续使用当前可用配置运行`);
+      if (remainingVersion) {
+        console.error(`  - 当前配置版本: v${remainingVersion}`);
+      }
+      console.error('\n[配置热加载] 建议操作:');
+      console.error('  1. 检查配置文件的语法是否正确');
+      console.error('  2. 确保所有必需的字段都已正确配置');
+      console.error('  3. 修复错误后保存配置文件');
+      console.error('='.repeat(60));
+
+      this.isReloading = false;
+      return {
+        success: false,
+        error: error instanceof Error ? error : new Error(errorMessage),
+        message: `配置热加载异常: ${errorMessage}`,
+        configVersion: remainingVersion,
+      };
+    }
+  }
+
+  async rollback(): Promise<ReloadResult> {
+    if (!this.server) {
+      const message = '[配置回滚] 服务器未运行，无法回滚';
+      console.error(message);
+      return {
+        success: false,
+        error: new Error(message),
+        message,
+      };
+    }
+
+    if (!this.server.hasPreviousConfig()) {
+      const message = '[配置回滚] 没有可回滚的上一版配置';
+      console.log(message);
+      return {
+        success: false,
+        error: new Error(message),
+        message,
+      };
+    }
+
+    const currentVersion = this.server.getConfigVersion();
+    console.log('\n' + '='.repeat(60));
+    console.log('[配置回滚] 开始手动回滚...');
+    console.log(`[配置回滚] 当前版本: v${currentVersion}`);
+    console.log('='.repeat(60));
+
+    const result = this.server.rollbackToPreviousConfig();
+
+    if (result.success) {
+      const newVersion = this.server.getConfigVersion();
+      console.log('\n' + '='.repeat(60));
+      console.log('[配置回滚成功] ✅');
+      console.log(`[配置回滚] 版本: v${currentVersion} -> v${newVersion}`);
+      console.log('='.repeat(60));
+
+      return {
+        success: true,
+        message: result.message,
+        configVersion: newVersion,
+      };
+    } else {
+      console.error('\n' + '='.repeat(60));
+      console.error('[配置回滚失败] ❌');
+      console.error(`[配置回滚] 错误: ${result.message}`);
+      console.error('='.repeat(60));
+
+      return {
+        success: false,
+        error: result.error,
+        message: result.message,
+        configVersion: currentVersion,
+      };
     }
   }
 
@@ -94,16 +305,30 @@ export class MockServerCLI {
       await this.server.stop();
       this.server = null;
     }
+
+    this.isReloading = false;
   }
 
   getServer(): MockServer | null {
     return this.server;
   }
+
+  isWatching(): boolean {
+    return this.watcher?.isWatching() ?? false;
+  }
+
+  getCurrentConfigVersion(): number | null {
+    return this.server?.getConfigVersion() ?? null;
+  }
+
+  hasPreviousConfig(): boolean {
+    return this.server?.hasPreviousConfig() ?? false;
+  }
 }
 
 export { MockConfig, MockRoute, MockResponse } from './types';
 export { ConfigLoader } from './core/config';
-export { MockServer } from './core/server';
+export { MockServer, ConfigUpdateResult } from './core/server';
 export { Router } from './core/router';
 export { TemplateEngine, TemplateContext } from './core/template';
 export { ConfigWatcher, ConfigWatcherOptions } from './core/watcher';
@@ -113,7 +338,22 @@ if (require.main === module) {
 
   if (!configPath) {
     console.log('用法: mock-server <config-file> [port] [--no-watch]');
-    console.log('示例: mock-server ./mock.config.ts 3000');
+    console.log('');
+    console.log('参数说明:');
+    console.log('  <config-file>  必需: 配置文件路径 (.js, .ts, .json)');
+    console.log('  [port]         可选: 服务器端口 (默认: 3000)');
+    console.log('  [--no-watch]   可选: 禁用配置文件热监听');
+    console.log('');
+    console.log('示例:');
+    console.log('  mock-server ./mock.config.ts');
+    console.log('  mock-server ./mock.config.ts 8080');
+    console.log('  mock-server ./mock.config.json 3000 --no-watch');
+    console.log('');
+    console.log('配置文件格式要求:');
+    console.log('  必须包含 routes 数组，每个路由需要:');
+    console.log('    - method: HTTP 方法 (GET, POST, PUT, DELETE, 等)');
+    console.log('    - path: 路由路径 (支持动态参数如 /users/:id)');
+    console.log('    - response: 响应配置 (包含 status, 可选 body, headers, delay)');
     process.exit(1);
   }
 
@@ -136,7 +376,11 @@ if (require.main === module) {
   });
 
   cli.start().catch((error) => {
-    console.error('启动服务器失败:', error);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('\n' + '='.repeat(60));
+    console.error('[启动失败]');
+    console.error(`  错误: ${errorMessage}`);
+    console.error('='.repeat(60));
     process.exit(1);
   });
 }
